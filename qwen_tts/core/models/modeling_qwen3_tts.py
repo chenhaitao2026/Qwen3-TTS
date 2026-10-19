@@ -1665,26 +1665,48 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         if inputs_embeds is not None and inputs_embeds.shape[1] > 1:
             generation_step = -1
             codec_ids = None
+            mtp = getattr(self, "codebook_mtp", None)
+            if mtp is not None and mtp.config.attend_time and not self.training:
+                mtp.reset_cache()
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)
-            predictor_result = self.code_predictor.generate(
-                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                max_new_tokens=self.config.num_code_groups - 1,
-                do_sample=subtalker_dosample,
-                top_p=subtalker_top_p,
-                top_k=subtalker_top_k,
-                temperature=subtalker_temperature,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-            )
-            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
-            codec_hiddens = torch.cat(
-                [last_id_hidden]
-                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
-                dim=1,
-            )
-            inputs_embeds = codec_hiddens.sum(1, keepdim=True)
+            mtp = getattr(self, "codebook_mtp", None)
+            if mtp is not None:
+                # past_hidden scored this codec-0 token. MTP completes that same frame
+                # in one pass of shared layers plus one layer per residual codebook.
+                codec_ids = mtp.decode_step(
+                    talker_hidden=past_hidden,
+                    code0=input_ids.reshape(past_hidden.shape[0], -1)[:, 0],
+                    position_ids=self._codebook_mtp_positions(cache_position, past_hidden.shape[0], past_hidden.device),
+                    do_sample=True if subtalker_dosample is None else subtalker_dosample,
+                    temperature=0.9 if subtalker_temperature is None else subtalker_temperature,
+                    top_k=50 if subtalker_top_k is None else subtalker_top_k,
+                    top_p=1.0 if subtalker_top_p is None else subtalker_top_p,
+                ).codes
+                inputs_embeds = mtp.fuse_frame(
+                    last_id_hidden,
+                    self.code_predictor.get_input_embeddings(),
+                    codec_ids,
+                )
+            else:
+                predictor_result = self.code_predictor.generate(
+                    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
+                    max_new_tokens=self.config.num_code_groups - 1,
+                    do_sample=subtalker_dosample,
+                    top_p=subtalker_top_p,
+                    top_k=subtalker_top_k,
+                    temperature=subtalker_temperature,
+                    output_hidden_states=True,
+                    return_dict_in_generate=True,
+                )
+                codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+                codec_hiddens = torch.cat(
+                    [last_id_hidden]
+                    + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                    dim=1,
+                )
+                inputs_embeds = codec_hiddens.sum(1, keepdim=True)
 
             if generation_step < trailing_text_hidden.shape[1]:
                 inputs_embeds = inputs_embeds + trailing_text_hidden[:, generation_step].unsqueeze(1)
@@ -1724,6 +1746,33 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         )
 
         hidden_states = outputs.last_hidden_state
+        mtp = getattr(self, "codebook_mtp", None)
+        # Cache the prompt in the decoder, except the last position: that hidden
+        # scored the first sampled code 0 and is run by the first decode step.
+        if (
+            mtp is not None
+            and mtp.config.attend_time
+            and not self.training
+            and generation_step == -1
+            and hidden_states.shape[1] > 1
+            and attention_mask is not None
+        ):
+            ctx_len = hidden_states.shape[1] - 1
+            ctx = hidden_states[:, :ctx_len]
+            zeros = torch.zeros(
+                ctx.shape[0],
+                ctx_len,
+                mtp.config.num_code_groups,
+                dtype=torch.long,
+                device=ctx.device,
+            )
+            mtp.prefill(
+                ctx,
+                zeros,
+                torch.zeros(ctx.shape[0], ctx_len, dtype=torch.bool, device=ctx.device),
+                position_ids=position_ids[0, :, :ctx_len],
+                padding_mask=attention_mask[:, :ctx_len],
+            )
         logits = self.codec_head(hidden_states)
 
         loss = None
@@ -1798,6 +1847,17 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         mrope_position_deltas = max_position_ids + 1 - torch.sum(attention_mask, dim=-1, keepdim=True)
 
         return position_ids, mrope_position_deltas
+
+    def _codebook_mtp_positions(self, cache_position, batch, device):
+        """Absolute position of `past_hidden`, one step behind the token being written."""
+        if cache_position is None:
+            base = torch.zeros((), device=device, dtype=torch.long)
+        else:
+            base = cache_position.reshape(-1)[0].to(device=device)
+        pos = base - 1
+        if self.rope_deltas is None:
+            return pos.expand(batch).to(dtype=torch.long)
+        return (pos + self.rope_deltas.reshape(-1).to(device=device)).to(dtype=torch.long)
 
     def _update_model_kwargs_for_generation(self, outputs, model_kwargs, is_encoder_decoder=False, num_new_tokens=1):
         model_kwargs = super()._update_model_kwargs_for_generation(
