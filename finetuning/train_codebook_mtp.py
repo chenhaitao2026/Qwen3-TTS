@@ -26,7 +26,13 @@ loss dominate the codebook-0 loss.
         --train_jsonl data/train_with_codes.jsonl \
         --output_model_path output/mtp_stage2 \
         --train_talker --talker_lr 5e-6 --lr 2e-5 \
+        --lr_scheduler cosine --warmup_ratio 0.03 \
         --mtp_loss_weight 0.5 --num_epochs 1
+
+`--lr_scheduler constant` (the default) is the historical flat-LR behaviour;
+`cosine` or `linear` add a linear warmup of `--warmup_ratio` total steps and
+decay to `--min_lr_ratio` of the initial LR.  The schedule advances once per
+optimizer step and follows `--max_steps`.
 
 The JSONL must be the output of `finetuning/prepare_data.py`, i.e. it must
 contain real `audio_codes` produced from the target WAV.  See
@@ -38,6 +44,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import shutil
 import sys
@@ -45,6 +52,7 @@ import sys
 import torch
 from accelerate import Accelerator
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
 
@@ -108,6 +116,28 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Stop after N optimizer steps per epoch (0 = no limit).",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        choices=("constant", "cosine", "linear"),
+        default="constant",
+        help=(
+            "Learning-rate schedule, stepped once per optimizer step.  "
+            "'constant' keeps the historical behaviour (no scheduler)."
+        ),
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.03,
+        help="Fraction of total optimizer steps used for linear warmup.",
+    )
+    parser.add_argument(
+        "--min_lr_ratio",
+        type=float,
+        default=0.1,
+        help="Final LR as a fraction of the initial LR when decaying.",
     )
 
     # MTP architecture
@@ -367,9 +397,60 @@ def _save_full_model(raw_model, local_model_path, output_dir):
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
 
 
+def _steps_per_epoch(args, num_batches: int, num_processes: int) -> int:
+    """Optimizer steps per epoch, accounting for sharding, --max_steps, accumulation."""
+    if num_processes > 1:
+        num_batches = math.ceil(num_batches / num_processes)
+    if args.max_steps:
+        num_batches = min(num_batches, args.max_steps)
+    return max(1, math.ceil(num_batches / args.gradient_accumulation_steps))
+
+
+def _build_lr_scheduler(optimizer, args, steps_per_epoch: int):
+    """Linear warmup followed by cosine/linear decay, advanced per optimizer step.
+
+    The scheduler is deliberately *not* handed to `accelerator.prepare`:
+    accelerate's AcceleratedScheduler advances `num_processes` times per
+    synchronized step when batches are not split, which would tie the schedule
+    to the world size instead of the optimizer step count.  We step it
+    ourselves under `accelerator.sync_gradients`.
+    """
+    if args.lr_scheduler == "constant":
+        return None, 0, 0
+
+    total_steps = max(1, steps_per_epoch * args.num_epochs)
+    warmup_steps = int(round(args.warmup_ratio * total_steps))
+    warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+    decay_steps = max(1, total_steps - warmup_steps)
+    min_ratio = args.min_lr_ratio
+
+    def lr_lambda(step: int) -> float:
+        if warmup_steps and step < warmup_steps:
+            # LambdaLR starts at step 0, so start from base_lr / warmup_steps
+            # rather than exactly zero.
+            return float(step + 1) / float(warmup_steps)
+        # Anchor progress so that the very last optimizer step lands exactly on
+        # min_lr_ratio; the clamp keeps extra steps (if the estimate is off by
+        # one due to sharding) at the floor instead of overshooting.
+        progress = (step - warmup_steps) / max(1, decay_steps - 1)
+        progress = min(1.0, max(0.0, progress))
+        if args.lr_scheduler == "linear":
+            return 1.0 - (1.0 - min_ratio) * progress
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_ratio + (1.0 - min_ratio) * cosine
+
+    scheduler = LambdaLR(optimizer, lr_lambda, last_epoch=-1)
+    return scheduler, warmup_steps, total_steps
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
+
+    if not 0.0 <= args.warmup_ratio < 1.0:
+        raise SystemExit("--warmup_ratio must be in [0, 1).")
+    if not 0.0 <= args.min_lr_ratio <= 1.0:
+        raise SystemExit("--min_lr_ratio must be in [0, 1].")
 
     local_model_path = (
         args.init_model_path
@@ -458,6 +539,10 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision="bf16" if args.dtype == "bf16" else "no",
     )
+    steps_per_epoch = _steps_per_epoch(args, len(dataloader), accelerator.num_processes)
+    scheduler, warmup_steps, total_steps = _build_lr_scheduler(
+        optimizer, args, steps_per_epoch
+    )
     model, optimizer, dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, dataloader
     )
@@ -471,6 +556,14 @@ def main() -> None:
         f"time_attention={not args.no_time_attention} | "
         f"distill_weight={args.distill_weight}"
     )
+    if scheduler is None:
+        accelerator.print(f"lr schedule: constant | lr={args.lr:g}")
+    else:
+        accelerator.print(
+            f"lr schedule: {args.lr_scheduler} | steps/epoch={steps_per_epoch} | "
+            f"total_steps={total_steps} | warmup_steps={warmup_steps} | "
+            f"min_lr_ratio={args.min_lr_ratio}"
+        )
 
     save_full = args.save_full_model or args.train_talker
     for epoch in range(args.num_epochs):
@@ -495,6 +588,8 @@ def main() -> None:
                         args.max_grad_norm,
                     )
                 optimizer.step()
+                if scheduler is not None and accelerator.sync_gradients:
+                    scheduler.step()
                 optimizer.zero_grad()
 
             running_loss += loss.detach().float().item()
@@ -516,6 +611,8 @@ def main() -> None:
                 )
                 if talker_loss is not None:
                     message += f" | talker {talker_loss.item():.4f}"
+                if scheduler is not None:
+                    message += f" | lr {optimizer.param_groups[0]['lr']:.2e}"
                 accelerator.print(message)
 
         if accelerator.is_main_process and logged_steps:

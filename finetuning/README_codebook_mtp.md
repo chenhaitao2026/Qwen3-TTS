@@ -114,6 +114,36 @@ The script:
 Learning rates around `1e-4..3e-4` work for the warm-started MTP.  Use a
 smaller rate if you initialize from a strong MTP checkpoint.
 
+### Learning-rate schedule
+
+By default the learning rate is constant (no scheduler, the historical
+behaviour).  `--lr_scheduler cosine` or `linear` adds a linear warmup over
+`--warmup_ratio` of the total optimizer steps and then decays to
+`--min_lr_ratio` of the initial rate:
+
+```bash
+python train_codebook_mtp.py \
+  ... \
+  --lr_scheduler cosine --warmup_ratio 0.03 --min_lr_ratio 0.1
+```
+
+The schedule is advanced once per optimizer step (not per micro-batch), so it
+matches the real number of updates, and it follows `--max_steps`.  Each
+parameter group keeps its own base rate (`--lr` for the MTP, `--talker_lr` for
+the talker) and is scaled by the same factor.
+
+* **Stage 1** does not need a schedule; a short warmup is the useful part if
+  the first steps look unstable.  For very small datasets the flat rate is
+  simpler and differences are small.
+* **Stage 2** is where a schedule matters: a flat `--talker_lr 5e-6` for a full
+  epoch keeps nudging a 1.7B pretrained talker late in training.  Use
+  `--lr_scheduler cosine --warmup_ratio 0.03` and keep `--talker_lr` at or
+  below `5e-6`.
+
+Without a scheduler you can emulate a step decay by stopping after N epochs and
+restarting from `checkpoint-epoch-N-1/codebook_mtp` with `--init_mtp_checkpoint`
+and a smaller `--lr`.
+
 ### Optional distillation from the old code predictor
 
 The original 5-layer predictor is a useful teacher because it was trained on
@@ -143,6 +173,8 @@ python train_codebook_mtp.py \
   --train_talker \
   --talker_lr 5e-6 \
   --lr 2e-5 \
+  --lr_scheduler cosine \
+  --warmup_ratio 0.03 \
   --mtp_loss_weight 0.5 \
   --num_epochs 1
 ```
