@@ -1586,10 +1586,20 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         )
 
         self.codec_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.code_predictor = Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(
-            config=config.code_predictor_config,
-            talker_config=config
-        )
+        if getattr(config.code_predictor_config, "mtp_type", None) == "codebook_mtp":
+            # Local import keeps `modeling_qwen3_tts` importable on its own and
+            # lets checkpoints carry `code_predictor_config.mtp_type`.
+            from .codebook_mtp import Qwen3TTSCodebookMTPForConditionalGeneration
+
+            self.code_predictor = Qwen3TTSCodebookMTPForConditionalGeneration(
+                config=config.code_predictor_config,
+                talker_config=config,
+            )
+        else:
+            self.code_predictor = Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(
+                config=config.code_predictor_config,
+                talker_config=config
+            )
         self.rope_deltas = None
 
         # Initialize weights and apply final processing
@@ -1674,6 +1684,10 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         if inputs_embeds is not None and inputs_embeds.shape[1] > 1:
             generation_step = -1
             codec_ids = None
+            # Codebook-MTP keeps one KV cache per codebook layer.  A prefill is
+            # the start of a new utterance, so drop the previous one.
+            if hasattr(self.code_predictor, "reset_cache"):
+                self.code_predictor.reset_cache()
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)

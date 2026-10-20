@@ -126,3 +126,11 @@ python sft_12hz.py \
   --num_epochs ${EPOCHS} \
   --speaker_name ${SPEAKER_NAME}
 ```
+
+### Optional: Drama-3-style codebook-MTP decoder
+
+[`README_codebook_mtp.md`](README_codebook_mtp.md) describes how to replace
+the 5-layer x 15-pass code predictor with a codebook-MTP decoder (4 shared
+layers + 15 per-codebook layers, 19 layer passes per frame), including the
+two-stage training recipe, real-vs-generated code supervision, optional
+distillation from the original predictor, and inference commands.

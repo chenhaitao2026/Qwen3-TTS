@@ -16,3 +16,10 @@
 from .configuration_qwen3_tts import Qwen3TTSConfig
 from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 from .processing_qwen3_tts import Qwen3TTSProcessor
+from .codebook_mtp import (
+    Qwen3TTSCodebookMTPConfig,
+    Qwen3TTSCodebookMTPForConditionalGeneration,
+    install_codebook_mtp,
+    load_codebook_mtp,
+    save_codebook_mtp,
+)
