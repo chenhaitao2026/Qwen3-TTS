@@ -1239,7 +1239,16 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            # The logits already correspond to codec groups 1..N and `labels` has the
+            # same length. Passing them as `labels` would shift them a second time
+            # (head i would learn codec i+1), so disable the automatic shift.
+            loss = self.loss_function(
+                logits=logits,
+                labels=None,
+                shift_labels=labels.contiguous(),
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
 
         return Qwen3TTSTalkerCodePredictorOutputWithPast(
             loss=loss,
