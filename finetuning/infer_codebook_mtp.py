@@ -9,7 +9,7 @@ Use a full model saved by `train_codebook_mtp.py --train_talker`:
 
     python infer_codebook_mtp.py \
         --model_path output/mtp_stage2/checkpoint-epoch-0 \
-        --mode custom_voice --speaker vivian \
+        --mode custom_voice --speaker speaker_test \
         --text "Hello from the codebook MTP decoder." \
         --output_wav out.wav
 

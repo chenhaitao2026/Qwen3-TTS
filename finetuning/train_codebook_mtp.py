@@ -51,6 +51,7 @@ import sys
 
 import torch
 from accelerate import Accelerator
+from accelerate.utils import gather_object
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -83,6 +84,15 @@ def parse_args() -> argparse.Namespace:
         help="Base Qwen3-TTS checkpoint (or a directory containing one).",
     )
     parser.add_argument("--train_jsonl", type=str, required=True)
+    parser.add_argument(
+        "--speaker_name",
+        type=str,
+        default="speaker_test",
+        help=(
+            "Speaker name used for samples without a `speaker` field when a "
+            "full checkpoint is saved.  Matches `sft_12hz.py`."
+        ),
+    )
     parser.add_argument(
         "--output_model_path",
         type=str,
@@ -352,10 +362,25 @@ def _forward_loss(raw_model, mtp, teacher, batch, args):
     else:
         loss = mtp_loss
 
-    return loss, talker_loss, mtp_output
+    return loss, talker_loss, mtp_output, speaker_embedding
 
 
-def _save_full_model(raw_model, local_model_path, output_dir):
+def _record_speaker_embeddings(store, speakers, speaker_embedding, default_name):
+    """Keep the first embedding seen for each speaker, on CPU.
+
+    A full checkpoint stores custom-voice speakers as rows of
+    `talker.model.codec_embedding`, exactly like `sft_12hz.py`.  Inference
+    lowercases speaker names, so the keys are normalized here as well.
+    """
+    if speaker_embedding is None:
+        return
+    for index, speaker in enumerate(speakers):
+        name = str(speaker or default_name).lower()
+        if name not in store:
+            store[name] = speaker_embedding[index].detach().to("cpu", copy=True)
+
+
+def _save_full_model(raw_model, local_model_path, output_dir, speaker_embeddings=None):
     os.makedirs(output_dir, exist_ok=True)
     ignore = shutil.ignore_patterns(
         "*.safetensors",
@@ -372,9 +397,8 @@ def _save_full_model(raw_model, local_model_path, output_dir):
     with open(os.path.join(local_model_path, "config.json"), "r", encoding="utf-8") as handle:
         config_dict = json.load(handle)
     predictor_config = raw_model.config.talker_config.code_predictor_config
-    predictor_dict = config_dict.setdefault("talker_config", {}).setdefault(
-        "code_predictor_config", {}
-    )
+    talker_config = config_dict.setdefault("talker_config", {})
+    predictor_dict = talker_config.setdefault("code_predictor_config", {})
     for key in (
         "mtp_type",
         "mtp_shared_layers",
@@ -387,6 +411,30 @@ def _save_full_model(raw_model, local_model_path, output_dir):
     ):
         if hasattr(predictor_config, key):
             predictor_dict[key] = getattr(predictor_config, key)
+
+    speaker_embeddings = speaker_embeddings or {}
+    spk_id_map = dict(talker_config.get("spk_id") or {})
+    spk_is_dialect_map = dict(talker_config.get("spk_is_dialect") or {})
+    if speaker_embeddings:
+        # Keep the speakers that came with the initial checkpoint (for example
+        # the built-in CustomVoice speakers) and append the new ones.
+        num_embedding_rows = raw_model.talker.get_input_embeddings().weight.shape[0]
+        next_id = max(spk_id_map.values(), default=2999) + 1
+        for name in sorted(speaker_embeddings):
+            if name not in spk_id_map:
+                if next_id >= num_embedding_rows:
+                    raise ValueError(
+                        f"Cannot save speaker {name!r}: speaker id {next_id} is "
+                        f"outside codec_embedding (size {num_embedding_rows}). "
+                        "Reduce the number of distinct speakers."
+                    )
+                spk_id_map[name] = next_id
+                next_id += 1
+            spk_is_dialect_map.setdefault(name, False)
+        config_dict["tts_model_type"] = "custom_voice"
+        talker_config["spk_id"] = spk_id_map
+        talker_config["spk_is_dialect"] = spk_is_dialect_map
+
     with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as handle:
         json.dump(config_dict, handle, indent=2, ensure_ascii=False)
 
@@ -394,6 +442,24 @@ def _save_full_model(raw_model, local_model_path, output_dir):
         key: value.detach().to("cpu").contiguous()
         for key, value in raw_model.state_dict().items()
     }
+    if speaker_embeddings:
+        weight = state_dict["talker.model.codec_embedding.weight"]
+        for name, embedding in speaker_embeddings.items():
+            index = spk_id_map.get(name)
+            if index is not None:
+                weight[index] = embedding.to(
+                    device=weight.device, dtype=weight.dtype
+                )
+    if config_dict.get("tts_model_type") != "base":
+        # Base models use the separate speaker encoder for voice cloning;
+        # CustomVoice checkpoints embed the speaker in codec_embedding and do
+        # not instantiate it.  Dropping the weights keeps the checkpoint
+        # consistent with the config and avoids unexpected keys on load.
+        state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if not key.startswith("speaker_encoder.")
+        }
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
 
 
@@ -566,6 +632,7 @@ def main() -> None:
         )
 
     save_full = args.save_full_model or args.train_talker
+    target_speaker_embeddings = {}
     for epoch in range(args.num_epochs):
         model.train()
         running_loss = 0.0
@@ -578,7 +645,7 @@ def main() -> None:
             if args.max_steps and step >= args.max_steps:
                 break
             with accelerator.accumulate(model):
-                loss, talker_loss, mtp_output = _forward_loss(
+                loss, talker_loss, mtp_output, speaker_embedding = _forward_loss(
                     raw_model, mtp, teacher, batch, args
                 )
                 accelerator.backward(loss)
@@ -602,6 +669,13 @@ def main() -> None:
                 if running_codebooks is None
                 else running_codebooks + per_codebook
             )
+            if save_full:
+                _record_speaker_embeddings(
+                    target_speaker_embeddings,
+                    batch.get("speakers", []),
+                    speaker_embedding,
+                    args.speaker_name,
+                )
             logged_steps += 1
 
             if step % args.log_every == 0:
@@ -614,6 +688,12 @@ def main() -> None:
                 if scheduler is not None:
                     message += f" | lr {optimizer.param_groups[0]['lr']:.2e}"
                 accelerator.print(message)
+
+        gathered_speaker_embeddings = None
+        if save_full:
+            # Collective: every process must take part even though only the
+            # main process writes the checkpoint.
+            gathered_speaker_embeddings = gather_object([target_speaker_embeddings])
 
         if accelerator.is_main_process and logged_steps:
             average_codebooks = running_codebooks / logged_steps
@@ -638,7 +718,20 @@ def main() -> None:
                 os.path.join(checkpoint, "codebook_mtp"),
             )
             if save_full:
-                _save_full_model(raw_model, local_model_path, checkpoint)
+                merged_speaker_embeddings = {}
+                for process_embeddings in gathered_speaker_embeddings:
+                    for name, embedding in process_embeddings.items():
+                        merged_speaker_embeddings.setdefault(name, embedding)
+                _save_full_model(
+                    raw_model,
+                    local_model_path,
+                    checkpoint,
+                    merged_speaker_embeddings,
+                )
+                accelerator.print(
+                    "saved speakers: "
+                    + ", ".join(sorted(merged_speaker_embeddings))
+                )
             accelerator.print(f"saved {checkpoint}")
 
     accelerator.wait_for_everyone()

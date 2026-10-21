@@ -193,7 +193,20 @@ next hidden state.  If you must run a single-stage SFT, use `lambda` around
 `0.3..1.0`, not a large value, and prefer stage 1 first.
 
 Stage 2 saves a full model (`checkpoint-epoch-N/`), so inference can load it
-directly.
+directly.  The full checkpoint is saved as a CustomVoice model, matching
+`finetuning/sft_12hz.py`:
+
+* the speaker embeddings extracted from each sample's `ref_audio` are written
+  into `talker.model.codec_embedding` (and the separate `speaker_encoder` is
+  not saved);
+* `talker_config.spk_id` / `talker_config.spk_is_dialect` are added to
+  `config.json`, and `tts_model_type` becomes `custom_voice`;
+* the speaker keys come from the dataset's `speaker` field.  Samples without
+  that field use `--speaker_name` (default: `speaker_test`).
+
+Use one of those saved speaker names at inference time.  A full checkpoint is
+intended for `generate_custom_voice`; use the base model plus a stage-1 MTP
+checkpoint if you need voice cloning.
 
 ## Inference
 
@@ -203,7 +216,7 @@ Full model from stage 2:
 python infer_codebook_mtp.py \
   --model_path output/mtp_stage2/checkpoint-epoch-0 \
   --mode custom_voice \
-  --speaker vivian \
+  --speaker speaker_test \
   --text "Hello from the codebook MTP decoder." \
   --output_wav out.wav
 ```
