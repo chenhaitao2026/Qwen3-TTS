@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Data / optimization
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-4, help="MTP learning rate.")
@@ -274,7 +274,9 @@ def _teacher_logits(teacher, talker, hidden, codec_ids, audio_mask):
             codec_ids[batch_index, time_index, 0]
         ).unsqueeze(1)
     )
-    for index in range(1, talker.config.num_code_groups):
+    # code0..code14 are the inputs of the within-frame predictor; feeding
+    # code15 would leak the target of the last residual codebook.
+    for index in range(1, talker.config.num_code_groups - 1):
         frames.append(
             teacher.get_input_embeddings()[index - 1](
                 codec_ids[batch_index, time_index, index]
@@ -349,12 +351,11 @@ def _forward_loss(raw_model, mtp, teacher, batch, args):
         code0_embeds=code0_embeds,
         attention_mask=mtp_attention_mask,
         teacher_logits=distill_teacher,
-        distill_weight=args.distill_weight,
         distill_temperature=args.distill_temperature,
         scheduled_sampling_ratio=args.scheduled_sampling,
     )
     mtp_loss = mtp_output.loss
-    if args.distill_weight > 0 and mtp_output.distill_loss is not None:
+    if mtp_output.distill_loss is not None:
         mtp_loss = mtp_loss + args.distill_weight * mtp_output.distill_loss
 
     if args.train_talker:
@@ -390,6 +391,18 @@ def _save_full_model(raw_model, local_model_path, output_dir, speaker_embeddings
         "*.index.json",
     )
     shutil.copytree(local_model_path, output_dir, dirs_exist_ok=True, ignore=ignore)
+    # The patterns above are meant to drop the top-level talker weights, which
+    # are written again below from `raw_model.state_dict()`.  They must not
+    # drop the speech tokenizer weights (speech_tokenizer/model.safetensors),
+    # because that sub-module is not part of `raw_model` and is required by
+    # `Qwen3TTSModel.from_pretrained` at inference time.
+    speech_tokenizer_src = os.path.join(local_model_path, "speech_tokenizer")
+    if os.path.isdir(speech_tokenizer_src):
+        shutil.copytree(
+            speech_tokenizer_src,
+            os.path.join(output_dir, "speech_tokenizer"),
+            dirs_exist_ok=True,
+        )
 
     # Start from the original config and only update the predictor fields.
     # `raw_model.config.to_dict()` can add serialization-only keys to nested

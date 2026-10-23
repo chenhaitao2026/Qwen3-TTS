@@ -722,7 +722,8 @@ class Qwen3TTSCodebookMTPForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedMo
             return_logits: return the full `[B, S, Q, V]` tensor.
             teacher_logits: optional `[B, S, Q, V]` soft targets from the old
                 code predictor, used for distillation.
-            distill_weight: weight of the KL term.  0 disables it.
+            distill_weight: deprecated compatibility argument.  The returned
+                `distill_loss` is unweighted; the caller applies the weight.
             scheduled_sampling_ratio: probability of feeding back the model's
                 own argmax code (for codebook >= 2) instead of the ground
                 truth during training.  This is a DAgger-style regulariser,
@@ -803,7 +804,7 @@ class Qwen3TTSCodebookMTPForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedMo
             else:
                 per_codebook.append(logits.sum() * 0.0)
 
-            if teacher_logits is not None and distill_weight:
+            if teacher_logits is not None:
                 t_logits = teacher_logits[:, :, index, :][audio_mask]
                 s_logits = logits[audio_mask]
                 temperature = max(float(distill_temperature), 1e-5)
